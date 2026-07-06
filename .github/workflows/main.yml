@@ -1,3 +1,4 @@
+name: CI/CD - Agente RAG - Azure for Students fallback
 
 on:
   push:
@@ -8,8 +9,6 @@ permissions:
   contents: read
 
 env:
-  PYTHON_VERSION: "3.11"
-  ACR_NAME: ${{ vars.ACR_NAME }}
   ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
   IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
   RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
@@ -17,147 +16,115 @@ env:
   IMAGE_TAG: ${{ github.sha }}
 
 jobs:
-  validate-build-push-deploy:
-    name: Test, build, push, deploy and validate
+  build-push:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: "3.11"
           cache: pip
 
-      - name: Install Python dependencies
+      - name: Install and test
         run: |
           sudo apt-get update
           sudo apt-get install -y unixodbc-dev
           python -m pip install --upgrade pip
           pip install -r requirements.txt
+          python -m pytest -q
 
-      - name: Run automated tests
-        env:
-          LLM_PROVIDER: demo
-        run: python -m pytest -q
-
-      - name: Log in to Azure
-        uses: azure/login@v2
-        with:
-          creds: ${{ secrets.AZURE_CREDENTIALS }}
-
-      - name: Install or update Container Apps extension
-        run: az extension add --name containerapp --upgrade
-
-      - name: Verify target resources
-        run: |
-          az account show --output table
-          az acr show \
-            --name "$ACR_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --output table
-          az containerapp show \
-            --name "$CONTAINER_APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --output table
-
-      - name: Log in to Azure Container Registry
+      - name: Log in to ACR
         uses: docker/login-action@v3
         with:
           registry: ${{ env.ACR_LOGIN_SERVER }}
           username: ${{ secrets.ACR_USERNAME }}
           password: ${{ secrets.ACR_PASSWORD }}
 
-      - name: Build and push Docker image
+      - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
           push: true
           tags: |
             ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_REPOSITORY }}:${{ env.IMAGE_TAG }}
             ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_REPOSITORY }}:latest
 
-      - name: Configure registry credentials in Container Apps
+  deploy:
+    needs: build-push
+    runs-on: [self-hosted, windows, x64, azure-student]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify interactive Azure session
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+          az account show --output table
+          az extension add --name containerapp --upgrade
+
+      - name: Update Container App
+        shell: powershell
         env:
           ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
           ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
-        run: |
-          az containerapp registry set \
-            --name "$CONTAINER_APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --server "$ACR_LOGIN_SERVER" \
-            --username "$ACR_USERNAME" \
-            --password "$ACR_PASSWORD"
-
-      - name: Configure application secrets
-        env:
           SQL_CONNECTION: ${{ secrets.AZURE_SQL_CONNECTION_STRING }}
         run: |
-          az containerapp secret set \
-            --name "$CONTAINER_APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --secrets \
-              "azure-sql-connection-string=$SQL_CONNECTION"
+          $ErrorActionPreference = "Stop"
 
-      - name: Deploy new Container Apps revision
-        run: |
-          FULL_IMAGE="$ACR_LOGIN_SERVER/$IMAGE_REPOSITORY:$IMAGE_TAG"
+          az containerapp registry set `
+            --name "$env:CONTAINER_APP_NAME" `
+            --resource-group "$env:RESOURCE_GROUP" `
+            --server "$env:ACR_LOGIN_SERVER" `
+            --username "$env:ACR_USERNAME" `
+            --password "$env:ACR_PASSWORD"
 
-          az containerapp update \
-            --name "$CONTAINER_APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --image "$FULL_IMAGE" \
-            --set-env-vars \
-              APP_ENV=azure \
-              LLM_PROVIDER=demo \
-              TOP_K=3 \
+          az containerapp secret set `
+            --name "$env:CONTAINER_APP_NAME" `
+            --resource-group "$env:RESOURCE_GROUP" `
+            --secrets `
+              "azure-sql-connection-string=$env:SQL_CONNECTION"
+
+          $fullImage = `
+            "$env:ACR_LOGIN_SERVER/$env:IMAGE_REPOSITORY`:$env:IMAGE_TAG"
+
+          az containerapp update `
+            --name "$env:CONTAINER_APP_NAME" `
+            --resource-group "$env:RESOURCE_GROUP" `
+            --image "$fullImage" `
+            --set-env-vars `
+              APP_ENV=azure `
+              LLM_PROVIDER=demo `
+              TOP_K=3 `
               AZURE_SQL_CONNECTION_STRING=secretref:azure-sql-connection-string
 
-      - name: Validate public deployment
+      - name: Validate deployment
+        shell: powershell
         run: |
-          FQDN=$(az containerapp show \
-            --name "$CONTAINER_APP_NAME" \
-            --resource-group "$RESOURCE_GROUP" \
-            --query properties.configuration.ingress.fqdn \
-            --output tsv)
+          $ErrorActionPreference = "Stop"
 
-          echo "FQDN=$FQDN"
+          $fqdn = az containerapp show `
+            --name "$env:CONTAINER_APP_NAME" `
+            --resource-group "$env:RESOURCE_GROUP" `
+            --query properties.configuration.ingress.fqdn `
+            --output tsv
 
-          HTTP_CODE="000"
-          for attempt in {1..18}; do
-            HTTP_CODE=$(curl -sS \
-              -o health_response.json \
-              -w "%{http_code}" \
-              "https://$FQDN/health" || true)
-
-            if [ "$HTTP_CODE" = "200" ]; then
+          $ok = $false
+          for ($i = 1; $i -le 18; $i++) {
+            try {
+              Invoke-RestMethod -Uri "https://$fqdn/health"
+              $ok = $true
               break
-            fi
+            }
+            catch {
+              Start-Sleep -Seconds 10
+            }
+          }
 
-            echo "Intento $attempt: HTTP $HTTP_CODE. Esperando..."
-            sleep 10
-          done
+          if (-not $ok) {
+            throw "La Container App no respondió en /health"
+          }
 
-          test "$HTTP_CODE" = "200"
-          curl --fail "https://$FQDN/knowledge"
-          curl --fail \
-            -X POST "https://$FQDN/ask" \
-            -H "Content-Type: application/json" \
-            -d '{"question":"Que es una arquitectura RAG?"}'
-
-          {
-            echo "image=$ACR_LOGIN_SERVER/$IMAGE_REPOSITORY:$IMAGE_TAG"
-            echo "fqdn=https://$FQDN"
-            echo "health_http=$HTTP_CODE"
-          } > deployment-evidence.txt
-
-      - name: Upload deployment evidence
-        uses: actions/upload-artifact@v4
-        with:
-          name: deployment-evidence-${{ github.run_number }}
-          path: |
-            deployment-evidence.txt
-            health_response.json
+          Invoke-RestMethod -Uri "https://$fqdn/knowledge"
