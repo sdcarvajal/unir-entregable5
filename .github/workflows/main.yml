@@ -14,7 +14,7 @@ env:
   ACA_API_VERSION: "2025-07-01"
 
   # Configuración del agente RAG
-  LLM_PROVIDER: "openai"
+  LLM_PROVIDER: "demo"
   EMBEDDING_MODEL: "text-embedding-3-small"
   CHAT_MODEL: "gpt-4.1-mini"
   TOP_K: "3"
