@@ -1,0 +1,163 @@
+
+on:
+  push:
+    branches: ["main"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  ACR_NAME: ${{ vars.ACR_NAME }}
+  ACR_LOGIN_SERVER: ${{ vars.ACR_LOGIN_SERVER }}
+  IMAGE_REPOSITORY: ${{ vars.IMAGE_REPOSITORY }}
+  RESOURCE_GROUP: ${{ vars.RESOURCE_GROUP }}
+  CONTAINER_APP_NAME: ${{ vars.CONTAINER_APP_NAME }}
+  IMAGE_TAG: ${{ github.sha }}
+
+jobs:
+  validate-build-push-deploy:
+    name: Test, build, push, deploy and validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+
+      - name: Install Python dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unixodbc-dev
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run automated tests
+        env:
+          LLM_PROVIDER: demo
+        run: python -m pytest -q
+
+      - name: Log in to Azure
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Install or update Container Apps extension
+        run: az extension add --name containerapp --upgrade
+
+      - name: Verify target resources
+        run: |
+          az account show --output table
+          az acr show \
+            --name "$ACR_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --output table
+          az containerapp show \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --output table
+
+      - name: Log in to Azure Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.ACR_LOGIN_SERVER }}
+          username: ${{ secrets.ACR_USERNAME }}
+          password: ${{ secrets.ACR_PASSWORD }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: |
+            ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_REPOSITORY }}:${{ env.IMAGE_TAG }}
+            ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_REPOSITORY }}:latest
+
+      - name: Configure registry credentials in Container Apps
+        env:
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          az containerapp registry set \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --server "$ACR_LOGIN_SERVER" \
+            --username "$ACR_USERNAME" \
+            --password "$ACR_PASSWORD"
+
+      - name: Configure application secrets
+        env:
+          SQL_CONNECTION: ${{ secrets.AZURE_SQL_CONNECTION_STRING }}
+        run: |
+          az containerapp secret set \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --secrets \
+              "azure-sql-connection-string=$SQL_CONNECTION"
+
+      - name: Deploy new Container Apps revision
+        run: |
+          FULL_IMAGE="$ACR_LOGIN_SERVER/$IMAGE_REPOSITORY:$IMAGE_TAG"
+
+          az containerapp update \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --image "$FULL_IMAGE" \
+            --set-env-vars \
+              APP_ENV=azure \
+              LLM_PROVIDER=demo \
+              TOP_K=3 \
+              AZURE_SQL_CONNECTION_STRING=secretref:azure-sql-connection-string
+
+      - name: Validate public deployment
+        run: |
+          FQDN=$(az containerapp show \
+            --name "$CONTAINER_APP_NAME" \
+            --resource-group "$RESOURCE_GROUP" \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)
+
+          echo "FQDN=$FQDN"
+
+          HTTP_CODE="000"
+          for attempt in {1..18}; do
+            HTTP_CODE=$(curl -sS \
+              -o health_response.json \
+              -w "%{http_code}" \
+              "https://$FQDN/health" || true)
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              break
+            fi
+
+            echo "Intento $attempt: HTTP $HTTP_CODE. Esperando..."
+            sleep 10
+          done
+
+          test "$HTTP_CODE" = "200"
+          curl --fail "https://$FQDN/knowledge"
+          curl --fail \
+            -X POST "https://$FQDN/ask" \
+            -H "Content-Type: application/json" \
+            -d '{"question":"Que es una arquitectura RAG?"}'
+
+          {
+            echo "image=$ACR_LOGIN_SERVER/$IMAGE_REPOSITORY:$IMAGE_TAG"
+            echo "fqdn=https://$FQDN"
+            echo "health_http=$HTTP_CODE"
+          } > deployment-evidence.txt
+
+      - name: Upload deployment evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-evidence-${{ github.run_number }}
+          path: |
+            deployment-evidence.txt
+            health_response.json
