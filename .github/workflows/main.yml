@@ -1,4 +1,4 @@
-name: CI/CD - Agente RAG - Azure for Students fallback
+name: CI-CD RAG - ACR + ACA + Azure SQL
 
 on:
   push:
@@ -9,122 +9,635 @@ permissions:
   contents: read
 
 env:
-  ACR_LOGIN_SERVER: ${{ secrets.ACR_LOGIN_SERVER }}
-  IMAGE_REPOSITORY: ${{ secrets.IMAGE_REPOSITORY }}
-  RESOURCE_GROUP: ${{ secrets.RESOURCE_GROUP }}
-  CONTAINER_APP_NAME: ${{ secrets.CONTAINER_APP_NAME }}
+  # =========================================================
+  # Configuración del agente RAG
+  # =========================================================
+  PORT: "8000"
+  IMAGE_REPOSITORY: "rag-agent-api"
   IMAGE_TAG: ${{ github.sha }}
 
+  LLM_PROVIDER: "openai"
+  EMBEDDING_MODEL: "text-embedding-3-small"
+  CHAT_MODEL: "gpt-4.1-mini"
+  TOP_K: "3"
+
+  # API estable de Azure Container Apps
+  ACA_API_VERSION: "2025-07-01"
+
+  # =========================================================
+  # Valores almacenados en GitHub Actions Secrets
+  # =========================================================
+  RESOURCE_GROUP: ${{ secrets.RESOURCE_GROUP }}
+  CONTAINER_APP_NAME: ${{ secrets.CONTAINER_APP_NAME }}
+
+  ACR_NAME: ${{ secrets.ACR_NAME }}
+  REGISTRY_LOGIN_SERVER: ${{ secrets.REGISTRY_LOGIN_SERVER }}
+  REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+  REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+
+  AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+  AZURE_BEARER_TOKEN: ${{ secrets.AZURE_BEARER_TOKEN }}
+
+  AZURE_SQL_CONNECTION_STRING: ${{ secrets.AZURE_SQL_CONNECTION_STRING }}
+  OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+
 jobs:
-  build-push:
+  build-test-push-deploy:
+    name: Test, build, push and deploy RAG to ACA
     runs-on: ubuntu-latest
+    timeout-minutes: 35
 
     steps:
-      - uses: actions/checkout@v4
+      # ---------------------------------------------------------
+      # 1. Descargar el repositorio
+      # ---------------------------------------------------------
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      # ---------------------------------------------------------
+      # 2. Preparar Python
+      # ---------------------------------------------------------
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+          cache: "pip"
 
-      - name: Install and test
+      # ---------------------------------------------------------
+      # 3. Instalar dependencias
+      # ---------------------------------------------------------
+      - name: Install dependencies
+        shell: bash
         run: |
-          sudo apt-get update
-          sudo apt-get install -y unixodbc-dev
+          set -euo pipefail
+
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+
+      # ---------------------------------------------------------
+      # 4. Ejecutar tests
+      # ---------------------------------------------------------
+      - name: Run tests
+        shell: bash
+        run: |
+          set -euo pipefail
           python -m pytest -q
 
-      - name: Log in to ACR
-        uses: docker/login-action@v3
-        with:
-          registry: ${{ env.ACR_LOGIN_SERVER }}
-          username: ${{ secrets.ACR_USERNAME }}
-          password: ${{ secrets.ACR_PASSWORD }}
-
-      - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_REPOSITORY }}:${{ env.IMAGE_TAG }}
-            ${{ env.ACR_LOGIN_SERVER }}/${{ env.IMAGE_REPOSITORY }}:latest
-
-  deploy:
-    needs: build-push
-    runs-on: [self-hosted, windows, x64, azure-student]
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Verify interactive Azure session
-        shell: powershell
+      # ---------------------------------------------------------
+      # 5. Validar archivos y Secrets
+      # ---------------------------------------------------------
+      - name: Validate configuration
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
-          az account show --output table
-          az extension add --name containerapp --upgrade
+          set -euo pipefail
 
-      - name: Update Container App
-        shell: powershell
-        env:
-          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
-          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
-          SQL_CONNECTION: ${{ secrets.AZURE_SQL_CONNECTION_STRING }}
+          test -f Dockerfile || {
+            echo "::error::No existe Dockerfile en la raíz."
+            exit 1
+          }
+
+          test -f requirements.txt || {
+            echo "::error::No existe requirements.txt."
+            exit 1
+          }
+
+          required=(
+            RESOURCE_GROUP
+            CONTAINER_APP_NAME
+            ACR_NAME
+            REGISTRY_LOGIN_SERVER
+            REGISTRY_USERNAME
+            REGISTRY_PASSWORD
+            AZURE_SUBSCRIPTION_ID
+            AZURE_BEARER_TOKEN
+            AZURE_SQL_CONNECTION_STRING
+            OPENAI_API_KEY
+          )
+
+          for name in "${required[@]}"; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::El secret ${name} está vacío o no existe."
+              exit 1
+            fi
+          done
+
+          if [[ "$REGISTRY_LOGIN_SERVER" == http* ]] || \
+             [[ "$REGISTRY_LOGIN_SERVER" == */ ]]; then
+            echo "::error::REGISTRY_LOGIN_SERVER debe ser nombre.azurecr.io."
+            echo "::error::No incluyas https:// ni una barra final."
+            exit 1
+          fi
+
+          if [[ "$AZURE_BEARER_TOKEN" == Bearer* ]]; then
+            echo "::error::AZURE_BEARER_TOKEN no debe empezar por Bearer."
+            exit 1
+          fi
+
+          echo "Configuración validada."
+          echo "ACR: $REGISTRY_LOGIN_SERVER"
+          echo "Imagen: $IMAGE_REPOSITORY"
+          echo "Container App: $CONTAINER_APP_NAME"
+          echo "Resource Group: $RESOURCE_GROUP"
+
+      # ---------------------------------------------------------
+      # 6. Login en ACR
+      # ---------------------------------------------------------
+      - name: Login to Azure Container Registry
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
+          set -euo pipefail
 
-          az containerapp registry set `
-            --name "$env:CONTAINER_APP_NAME" `
-            --resource-group "$env:RESOURCE_GROUP" `
-            --server "$env:ACR_LOGIN_SERVER" `
-            --username "$env:ACR_USERNAME" `
-            --password "$env:ACR_PASSWORD"
+          echo "$REGISTRY_PASSWORD" | docker login \
+            "$REGISTRY_LOGIN_SERVER" \
+            --username "$REGISTRY_USERNAME" \
+            --password-stdin
 
-          az containerapp secret set `
-            --name "$env:CONTAINER_APP_NAME" `
-            --resource-group "$env:RESOURCE_GROUP" `
-            --secrets `
-              "azure-sql-connection-string=$env:SQL_CONNECTION"
-
-          $fullImage = `
-            "$env:ACR_LOGIN_SERVER/$env:IMAGE_REPOSITORY`:$env:IMAGE_TAG"
-
-          az containerapp update `
-            --name "$env:CONTAINER_APP_NAME" `
-            --resource-group "$env:RESOURCE_GROUP" `
-            --image "$fullImage" `
-            --set-env-vars `
-              APP_ENV=azure `
-              LLM_PROVIDER=demo `
-              TOP_K=3 `
-              AZURE_SQL_CONNECTION_STRING=secretref:azure-sql-connection-string
-
-      - name: Validate deployment
-        shell: powershell
+      # ---------------------------------------------------------
+      # 7. Construir y publicar la imagen
+      # ---------------------------------------------------------
+      - name: Build and push Docker image
+        shell: bash
         run: |
-          $ErrorActionPreference = "Stop"
+          set -euo pipefail
 
-          $fqdn = az containerapp show `
-            --name "$env:CONTAINER_APP_NAME" `
-            --resource-group "$env:RESOURCE_GROUP" `
-            --query properties.configuration.ingress.fqdn `
-            --output tsv
+          IMAGE_SHA="${REGISTRY_LOGIN_SERVER}/${IMAGE_REPOSITORY}:${IMAGE_TAG}"
+          IMAGE_LATEST="${REGISTRY_LOGIN_SERVER}/${IMAGE_REPOSITORY}:latest"
 
-          $ok = $false
-          for ($i = 1; $i -le 18; $i++) {
-            try {
-              Invoke-RestMethod -Uri "https://$fqdn/health"
-              $ok = $true
+          echo "Construyendo $IMAGE_SHA"
+
+          docker build \
+            --file Dockerfile \
+            --tag "$IMAGE_SHA" \
+            --tag "$IMAGE_LATEST" \
+            .
+
+          docker push "$IMAGE_SHA"
+          docker push "$IMAGE_LATEST"
+
+          echo "IMAGE_SHA=$IMAGE_SHA" >> "$GITHUB_ENV"
+          echo "IMAGE_LATEST=$IMAGE_LATEST" >> "$GITHUB_ENV"
+
+      # ---------------------------------------------------------
+      # 8. Obtener la configuración actual de ACA
+      # ---------------------------------------------------------
+      - name: Read current Azure Container App
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACA_URL="https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/containerApps/${CONTAINER_APP_NAME}?api-version=${ACA_API_VERSION}"
+
+          HTTP_CODE=$(curl -sS \
+            -o aca_current.json \
+            -w "%{http_code}" \
+            -X GET "$ACA_URL" \
+            -H "Authorization: Bearer ${AZURE_BEARER_TOKEN}" \
+            -H "Content-Type: application/json" || echo "000")
+
+          echo "HTTP GET ACA: $HTTP_CODE"
+
+          case "$HTTP_CODE" in
+            200)
+              echo "Container App encontrada."
+              ;;
+
+            401)
+              echo "::error::AZURE_BEARER_TOKEN ha caducado o no es válido."
+              cat aca_current.json || true
+              exit 1
+              ;;
+
+            403)
+              echo "::error::El token no tiene permisos sobre la Container App."
+              cat aca_current.json || true
+              exit 1
+              ;;
+
+            404)
+              echo "::error::No existe ${CONTAINER_APP_NAME} en ${RESOURCE_GROUP}."
+              cat aca_current.json || true
+              exit 1
+              ;;
+
+            *)
+              echo "::error::No se pudo consultar ACA. HTTP ${HTTP_CODE}."
+              cat aca_current.json || true
+              exit 1
+              ;;
+          esac
+
+      # ---------------------------------------------------------
+      # 9. Generar el JSON de actualización de ACA
+      # ---------------------------------------------------------
+      - name: Generate ACA deployment JSON
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          python - <<'PY'
+          import json
+          import os
+          from copy import deepcopy
+
+          with open("aca_current.json", encoding="utf-8") as f:
+              current = json.load(f)
+
+          props = current.get("properties", {})
+
+          environment_id = (
+              props.get("environmentId")
+              or props.get("managedEnvironmentId")
+          )
+
+          if not environment_id:
+              raise SystemExit(
+                  "No se pudo obtener el environmentId de ACA."
+              )
+
+          template = deepcopy(props.get("template") or {})
+          configuration = deepcopy(
+              props.get("configuration") or {}
+          )
+
+          existing_containers = template.get("containers") or []
+
+          if existing_containers:
+              container = deepcopy(existing_containers[0])
+          else:
+              container = {}
+
+          container["name"] = (
+              container.get("name")
+              or os.environ["CONTAINER_APP_NAME"]
+          )
+
+          container["image"] = os.environ["IMAGE_SHA"]
+
+          container["env"] = [
+              {
+                  "name": "APP_ENV",
+                  "value": "azure"
+              },
+              {
+                  "name": "LLM_PROVIDER",
+                  "value": os.environ["LLM_PROVIDER"]
+              },
+              {
+                  "name": "AZURE_SQL_CONNECTION_STRING",
+                  "secretRef": "azure-sql-connection-string"
+              },
+              {
+                  "name": "OPENAI_API_KEY",
+                  "secretRef": "openai-api-key"
+              },
+              {
+                  "name": "EMBEDDING_MODEL",
+                  "value": os.environ["EMBEDDING_MODEL"]
+              },
+              {
+                  "name": "CHAT_MODEL",
+                  "value": os.environ["CHAT_MODEL"]
+              },
+              {
+                  "name": "TOP_K",
+                  "value": os.environ["TOP_K"]
+              }
+          ]
+
+          container.setdefault(
+              "resources",
+              {
+                  "cpu": 0.5,
+                  "memory": "1Gi"
+              }
+          )
+
+          # Azure generará automáticamente un nuevo sufijo de revisión.
+          template.pop("revisionSuffix", None)
+
+          template["containers"] = [container]
+
+          template.setdefault(
+              "scale",
+              {
+                  "minReplicas": 0,
+                  "maxReplicas": 1
+              }
+          )
+
+          ingress = deepcopy(
+              configuration.get("ingress") or {}
+          )
+
+          # Estas propiedades son calculadas por Azure.
+          ingress.pop("fqdn", None)
+          ingress.pop("exposedPort", None)
+
+          ingress.update(
+              {
+                  "external": True,
+                  "targetPort": int(os.environ["PORT"]),
+                  "transport": "auto",
+                  "allowInsecure": False,
+                  "traffic": [
+                      {
+                          "latestRevision": True,
+                          "weight": 100
+                      }
+                  ]
+              }
+          )
+
+          configuration["activeRevisionsMode"] = "Single"
+          configuration["ingress"] = ingress
+
+          configuration["secrets"] = [
+              {
+                  "name": "acr-password",
+                  "value": os.environ["REGISTRY_PASSWORD"]
+              },
+              {
+                  "name": "azure-sql-connection-string",
+                  "value": os.environ[
+                      "AZURE_SQL_CONNECTION_STRING"
+                  ]
+              },
+              {
+                  "name": "openai-api-key",
+                  "value": os.environ["OPENAI_API_KEY"]
+              }
+          ]
+
+          configuration["registries"] = [
+              {
+                  "server": os.environ[
+                      "REGISTRY_LOGIN_SERVER"
+                  ],
+                  "username": os.environ[
+                      "REGISTRY_USERNAME"
+                  ],
+                  "passwordSecretRef": "acr-password"
+              }
+          ]
+
+          payload = {
+              "location": current["location"],
+              "properties": {
+                  "environmentId": environment_id,
+                  "configuration": configuration,
+                  "template": template
+              }
+          }
+
+          workload_profile = props.get(
+              "workloadProfileName"
+          )
+
+          if workload_profile:
+              payload["properties"][
+                  "workloadProfileName"
+              ] = workload_profile
+
+          if current.get("tags"):
+              payload["tags"] = current["tags"]
+
+          with open(
+              "aca_deployment.json",
+              "w",
+              encoding="utf-8"
+          ) as f:
+              json.dump(payload, f, indent=2)
+
+          print("aca_deployment.json generado.")
+          print("Imagen:", os.environ["IMAGE_SHA"])
+          print("Environment:", environment_id)
+          PY
+
+      # ---------------------------------------------------------
+      # 10. Actualizar ACA mediante Azure Management API
+      # ---------------------------------------------------------
+      - name: Deploy to Azure Container Apps
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACA_URL="https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/containerApps/${CONTAINER_APP_NAME}?api-version=${ACA_API_VERSION}"
+
+          HTTP_CODE=$(curl -sS \
+            -o aca_deploy_response.json \
+            -w "%{http_code}" \
+            -X PUT "$ACA_URL" \
+            -H "Authorization: Bearer ${AZURE_BEARER_TOKEN}" \
+            -H "Content-Type: application/json" \
+            --data-binary @aca_deployment.json || echo "000")
+
+          echo "HTTP PUT ACA: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" != "200" ] && \
+             [ "$HTTP_CODE" != "201" ] && \
+             [ "$HTTP_CODE" != "202" ]; then
+
+            echo "::error::Error actualizando ACA."
+            cat aca_deploy_response.json || true
+            exit 1
+          fi
+
+          echo "Solicitud de despliegue aceptada."
+
+      # ---------------------------------------------------------
+      # 11. Esperar a que la nueva revisión quede preparada
+      # ---------------------------------------------------------
+      - name: Wait for ACA revision
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACA_URL="https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/containerApps/${CONTAINER_APP_NAME}?api-version=${ACA_API_VERSION}"
+
+          for attempt in {1..40}; do
+            echo "Comprobación ${attempt}/40..."
+
+            curl -sS \
+              -o aca_status.json \
+              -X GET "$ACA_URL" \
+              -H "Authorization: Bearer ${AZURE_BEARER_TOKEN}" \
+              -H "Content-Type: application/json"
+
+            read -r STATE LATEST READY <<< "$(
+              python - <<'PY'
+          import json
+
+          with open(
+              "aca_status.json",
+              encoding="utf-8"
+          ) as f:
+              props = json.load(f).get(
+                  "properties",
+                  {}
+              )
+
+          print(
+              props.get("provisioningState", ""),
+              props.get("latestRevisionName", ""),
+              props.get("latestReadyRevisionName", "")
+          )
+          PY
+            )"
+
+            echo "ProvisioningState: $STATE"
+            echo "LatestRevision: $LATEST"
+            echo "ReadyRevision: $READY"
+
+            if [ "$STATE" = "Failed" ]; then
+              echo "::error::ACA ha fallado durante el despliegue."
+              cat aca_status.json
+              exit 1
+            fi
+
+            if [ "$STATE" = "Succeeded" ] && \
+               [ -n "$LATEST" ] && \
+               [ "$LATEST" = "$READY" ]; then
+
+              echo "Nueva revisión preparada correctamente."
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "::error::ACA no quedó preparada dentro del tiempo máximo."
+          cat aca_status.json || true
+          exit 1
+
+      # ---------------------------------------------------------
+      # 12. Validar endpoints del agente RAG
+      # ---------------------------------------------------------
+      - name: Validate deployed RAG API
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ACA_URL="https://management.azure.com/subscriptions/${AZURE_SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.App/containerApps/${CONTAINER_APP_NAME}?api-version=${ACA_API_VERSION}"
+
+          curl -sS \
+            -o aca_final.json \
+            -X GET "$ACA_URL" \
+            -H "Authorization: Bearer ${AZURE_BEARER_TOKEN}" \
+            -H "Content-Type: application/json"
+
+          FQDN=$(python - <<'PY'
+          import json
+
+          with open(
+              "aca_final.json",
+              encoding="utf-8"
+          ) as f:
+              data = json.load(f)
+
+          props = data.get("properties", {})
+
+          ingress = (
+              props
+              .get("configuration", {})
+              .get("ingress", {})
+          )
+
+          print(
+              ingress.get("fqdn")
+              or props.get("latestRevisionFqdn")
+              or ""
+          )
+          PY
+          )
+
+          if [ -z "$FQDN" ]; then
+            echo "::error::No se pudo obtener el FQDN de ACA."
+            exit 1
+          fi
+
+          PUBLIC_URL="https://${FQDN}"
+          HEALTH_URL="${PUBLIC_URL}/health"
+          KNOWLEDGE_URL="${PUBLIC_URL}/knowledge"
+          ASK_URL="${PUBLIC_URL}/ask"
+
+          echo "API pública: $PUBLIC_URL"
+          echo "Swagger: ${PUBLIC_URL}/docs"
+
+          # Espera activa para cold start o propagación del ingress
+          for attempt in {1..30}; do
+            HTTP_CODE=$(curl -sS \
+              -o health_response.json \
+              -w "%{http_code}" \
+              --connect-timeout 10 \
+              --max-time 20 \
+              "$HEALTH_URL" || echo "000")
+
+            echo "Intento /health ${attempt}/30: HTTP ${HTTP_CODE}"
+
+            if [ "$HTTP_CODE" = "200" ]; then
+              cat health_response.json
+              echo ""
               break
-            }
-            catch {
-              Start-Sleep -Seconds 10
-            }
-          }
+            fi
 
-          if (-not $ok) {
-            throw "La Container App no respondió en /health"
-          }
+            if [ "$attempt" = "30" ]; then
+              echo "::error::La API no responde correctamente en /health."
+              cat health_response.json || true
+              exit 1
+            fi
 
-          Invoke-RestMethod -Uri "https://$fqdn/knowledge"
+            sleep 10
+          done
+
+          echo "Validando /knowledge..."
+
+          KNOWLEDGE_CODE=$(curl -sS \
+            -o knowledge_response.json \
+            -w "%{http_code}" \
+            --connect-timeout 10 \
+            --max-time 30 \
+            "$KNOWLEDGE_URL" || echo "000")
+
+          if [ "$KNOWLEDGE_CODE" != "200" ]; then
+            echo "::error::/knowledge devolvió HTTP ${KNOWLEDGE_CODE}."
+            cat knowledge_response.json || true
+            exit 1
+          fi
+
+          echo "Validando /ask..."
+
+          cat > ask_request.json <<'JSON'
+          {
+            "question": "¿Qué papel cumple Azure Container Apps en esta práctica?"
+          }
+          JSON
+
+          ASK_CODE=$(curl -sS \
+            -o ask_response.json \
+            -w "%{http_code}" \
+            -X POST "$ASK_URL" \
+            -H "Content-Type: application/json" \
+            --data-binary @ask_request.json \
+            --connect-timeout 10 \
+            --max-time 90 || echo "000")
+
+          if [ "$ASK_CODE" != "200" ]; then
+            echo "::error::/ask devolvió HTTP ${ASK_CODE}."
+            cat ask_response.json || true
+            exit 1
+          fi
+
+          echo "Respuesta de /ask:"
+          cat ask_response.json
+          echo ""
+
+          {
+            echo "## Despliegue completado"
+            echo ""
+            echo "- Imagen: \`${IMAGE_SHA}\`"
+            echo "- API: ${PUBLIC_URL}"
+            echo "- Health: ${HEALTH_URL}"
+            echo "- Swagger: ${PUBLIC_URL}/docs"
+            echo "- Knowledge: ${KNOWLEDGE_URL}"
+          } >> "$GITHUB_STEP_SUMMARY"
